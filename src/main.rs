@@ -1,11 +1,12 @@
-use std::sync::Arc;
 use std::env::args;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::mpsc::{channel, Sender};
 
 use anyhow::Result;
 use axum::{Extension, extract, Json};
+use axum::body::{Bytes};
 use axum::http::StatusCode;
 use axum::routing::post;
 use image::imageops::{self, FilterType};
@@ -124,19 +125,18 @@ async fn main() -> Result<()> {
 
 async fn upload(mut multipart: extract::Multipart, Extension(predictor): Extension<Arc<Mutex<Predictor>>>) -> Result<Json<Prediction>, StatusCode> {
     while let Some(field) = multipart.next_field().await.unwrap() {
-        let name = field.name().unwrap().to_string();
-        println!("name");
+        let name = field.name().unwrap_or_default().to_string();
         let data = match name.as_str() {
-            "image" => { field.bytes().await.unwrap() }
+            "image" => { field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)? }
             "url" => {
-                todo!()
+                http_get(&field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             }
             &_ => {
-                todo!()
+                continue
             }
         };
 
-        let img = image::load_from_memory(&data).unwrap();
+        let img = image::load_from_memory(&data).map_err(|_|StatusCode::BAD_REQUEST)?;
         let resized_img = imageops::resize(&img.to_rgb8(), 224, 224, FilterType::Lanczos3);
         // let prediction = predictor.lock().await.predict(resized_img.to_vec()).await;
         let prediction = {
@@ -149,4 +149,11 @@ async fn upload(mut multipart: extract::Multipart, Extension(predictor): Extensi
         return prediction.map(|p| Json(p)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
     Err(StatusCode::BAD_REQUEST)
+}
+
+async fn http_get(url: &str) -> Result<Bytes> {
+    reqwest::get(url)
+        .await?
+        .bytes()
+        .await.map_err(|_| anyhow::anyhow!("failed to get bytes"))
 }
