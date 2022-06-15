@@ -1,23 +1,22 @@
-use std::{
-    env::args,
-    io,
-    sync::{
-        mpsc::{channel, Sender},
-        Arc, Mutex,
-    },
-    thread::spawn,
-};
+use std::sync::Arc;
+use std::env::args;
+use std::net::SocketAddr;
+use std::str::FromStr;
+use std::sync::mpsc::{channel, Sender};
 
 use anyhow::Result;
+use axum::{Extension, extract, Json};
+use axum::http::StatusCode;
+use axum::routing::post;
 use image::imageops::{self, FilterType};
 use onnxruntime::{
-    environment::Environment, ndarray::Array4, session::Session, tensor::OrtOwnedTensor,
-    GraphOptimizationLevel,
+    environment::Environment, GraphOptimizationLevel, ndarray::Array4, session::Session,
+    tensor::OrtOwnedTensor,
 };
-use rouille::{self, input::post::BufferedFile, post_input, try_or_400, Response};
 use serde::Serialize;
+use tokio::sync::{Mutex, oneshot};
 
-type TaskType = (Sender<Result<Prediction>>, Vec<u8>);
+type TaskType = (oneshot::Sender<Result<Prediction>>, Vec<u8>);
 
 #[derive(Debug, Serialize)]
 struct Prediction {
@@ -35,7 +34,7 @@ struct Predictor {
 impl Predictor {
     fn new(model_path: String, worker_thread: u16) -> Self {
         let (tx, rx) = channel::<TaskType>();
-        spawn(move || {
+        tokio::task::spawn_blocking(move || {
             let environment = Environment::builder().with_name("nsfw").build().unwrap();
             let mut session = environment
                 .new_session_builder()
@@ -52,10 +51,12 @@ impl Predictor {
         });
         Predictor { worker_channel: tx }
     }
-    fn predict(&self, image_bytes: Vec<u8>) -> Result<Prediction> {
-        let (tx, rx) = channel();
+
+    #[allow(dead_code)]
+    async fn predict(&self, image_bytes: Vec<u8>) -> Result<Prediction> {
+        let (tx, rx) = oneshot::channel();
         self.worker_channel.send((tx, image_bytes)).unwrap();
-        rx.recv().unwrap()
+        rx.await.unwrap()
     }
 }
 
@@ -95,7 +96,8 @@ HTTP Response:
     }
 "#;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = args();
     if args.len() < 4 {
         println!("{}", HELPER);
@@ -112,23 +114,39 @@ fn main() -> Result<()> {
 
     let predictor = Arc::new(Mutex::new(Predictor::new(model_path, worker_thread)));
 
-    rouille::start_server(bind_addr, move |request| {
-        let p = predictor.clone();
-        rouille::log(request, io::stdout(), || {
-            let post_input = try_or_400!(post_input!(request, { image: BufferedFile }));
+    let app = axum::Router::new().route("/", post(upload)).layer(Extension(predictor));
+    axum::Server::bind(&SocketAddr::from_str(&bind_addr).expect("error addr"))
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+    Ok(())
+}
 
-            let img = try_or_400!(image::load_from_memory(&post_input.image.data));
-            let resized_img = imageops::resize(&img.to_rgb8(), 224, 224, FilterType::Lanczos3);
-
-            let prediction = p.lock().unwrap().predict(resized_img.to_vec());
-
-            match prediction {
-                Ok(r) => Response::json(&r),
-                Err(e) => {
-                    let json = try_or_400::ErrJson::from_err(e.root_cause());
-                    Response::json(&json).with_status_code(400)
-                }
+async fn upload(mut multipart: extract::Multipart, Extension(predictor): Extension<Arc<Mutex<Predictor>>>) -> Result<Json<Prediction>, StatusCode> {
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let name = field.name().unwrap().to_string();
+        println!("name");
+        let data = match name.as_str() {
+            "image" => { field.bytes().await.unwrap() }
+            "url" => {
+                todo!()
             }
-        })
-    });
+            &_ => {
+                todo!()
+            }
+        };
+
+        let img = image::load_from_memory(&data).unwrap();
+        let resized_img = imageops::resize(&img.to_rgb8(), 224, 224, FilterType::Lanczos3);
+        // let prediction = predictor.lock().await.predict(resized_img.to_vec()).await;
+        let prediction = {
+            let (tx, rx) = oneshot::channel();
+            predictor.lock().await.worker_channel.send((tx, resized_img.to_vec())).unwrap();
+            rx.await.unwrap()
+        };
+        println!("Length of `{}` is {} bytes", name, data.len());
+
+        return prediction.map(|p| Json(p)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    Err(StatusCode::BAD_REQUEST)
 }
